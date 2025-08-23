@@ -1,0 +1,38 @@
+# 使用 Docker Compose 來定義 RabbitMQ 及 Flower 服務
+version: '3' # 指定 Docker Compose 的版本
+
+services: # 定義所有要啟動的服務
+  rabbitmq: # RabbitMQ 服務，負責訊息佇列管理
+    image: rabbitmq:3-management # 使用帶有管理介面的 RabbitMQ 映像檔
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"   # 映射 RabbitMQ 的訊息傳遞連接埠（預設 port）
+      - "15672:15672" # 映射 RabbitMQ 管理網頁的連接埠（用於網頁管理介面）
+    environment:
+      RABBITMQ_DEFAULT_USER: "worker" # 設定預設登入使用者名稱
+      RABBITMQ_DEFAULT_PASS: "worker" # 設定預設登入使用者密碼
+    networks:
+      - my_network # 將此服務加入名為 my_network 的自訂網路，方便與其他服務溝通
+
+  flower: # Flower 服務，用於監控 Celery 任務狀態
+    image: mher/flower:latest # 使用最新版本的 Flower 映像檔
+    container_name: flower
+    ports:
+      - "5555:5555" # 映射 Flower 的網頁介面連接埠
+    depends_on:
+      - rabbitmq # 先啟動 rabbitmq 服務，確保 broker 可用
+    command:
+      [
+        "celery",
+        "--broker=amqp://worker:worker@rabbitmq:5672//",
+        "flower",
+        "--port=5555"
+      ] # 啟動 Flower 並指定 RabbitMQ 為 broker
+    networks:
+      - my_network # 將此服務加入 my_network 網路，方便與 rabbitmq 溝通
+
+
+networks:
+  my_network: # 定義一個名為 my_network 的自訂網路，讓服務間可以互相連線
+    # 加入已經存在的網路
+    external: true
