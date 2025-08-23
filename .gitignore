@@ -2,3 +2,5 @@
 output/
 *.pyc
 .cache
+*.json
+*.jsonl
