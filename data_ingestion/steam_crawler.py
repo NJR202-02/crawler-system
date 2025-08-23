@@ -1,4 +1,3 @@
-# get_game_ids_streaming_with_names.py
 import requests
 import time
 import json
@@ -25,6 +24,7 @@ REVIEWS_CHECKPOINT_FILE = "reviews_checkpoint.json"    # 記錄抓到第幾個�
 
 
 # ---------- 基礎函式 ----------
+# 取得所有ID
 def get_all_apps():
     # 取得全部 app 清單（每筆含 appid 與 name）。
     resp = requests.get(URL_ALL, headers=HEADERS, timeout=30)
@@ -32,6 +32,7 @@ def get_all_apps():
     return resp.json().get("applist", {}).get("apps", [])
 
 
+# 取得遊戲資訊（含判定是否為遊戲）
 def get_game_info_if_game(appid: int) -> dict | None:
     """
     全量 call appdetails（不帶 filters/cc/l）。
@@ -151,6 +152,7 @@ def fetch_reviews_for_app(appid: int, out_path: str, max_pages: int | None = Non
 
 
 # ---------- 檔案/檢查點工具 ----------
+# 取資訊檢查點
 def load_checkpoint() -> int:
     # 回傳上次處理到的 index（下一次要從這裡開始）。沒有就回 0。
     if not os.path.exists(CHECKPOINT_FILE):
@@ -163,21 +165,15 @@ def load_checkpoint() -> int:
         return 0
 
 
+# 存資訊檢查點
 def save_checkpoint(next_index: int, processed: int, found: int):
     obj = {"next_index": next_index, "processed": processed, "found_game_ids": found, "ts": time.time()}
     with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
+# 取得現有json檔
 def load_existing_from_jsonl(path: str) -> Tuple[Set[int], Dict[int, str]]:
-    
-    # 讀取已經寫過的 jsonl，回傳：
-    #   - 已存在的 appid 集合（避免重複）
-    #   - 已存在的 {appid: name} 對照（方便重建快照）
-    # 相容兩種行格式：
-    #   1) 純整數： 570
-    #   2) 物件行： {"appid": 570, "name": "Dota 2"}
-    
     ids: Set[int] = set()
     id2name: Dict[int, str] = {}
     if not os.path.exists(path):
@@ -229,7 +225,7 @@ def load_reviews_checkpoint() -> int:
     except Exception:
         return 0
 
-
+# 存評論檢查點
 def save_reviews_checkpoint(next_index: int, processed_games: int):
     obj = {"next_index": next_index, "processed_games": processed_games, "ts": time.time()}
     with open(REVIEWS_CHECKPOINT_FILE, "w", encoding="utf-8") as f:
@@ -270,7 +266,7 @@ def main(limit_games: int | None = None, max_apps: int | None = None):
                     if limit_games and found_this_run >= limit_games:
                         # 提前結束前做個小收尾，之後可無縫續跑
                         save_checkpoint(next_index=i+1, processed=processed+1, found=len(found_ids))
-                        write_snapshot_array(RESULT_SNAPSHOT, id2name)
+                        # write_snapshot_array(RESULT_SNAPSHOT, id2name)
                         print(f"   已蒐集 {found_this_run} 款，達到上限 {limit_games}，先收。")
                         break
                                               
@@ -278,7 +274,7 @@ def main(limit_games: int | None = None, max_apps: int | None = None):
 
             if processed % CHECKPOINT_EVERY == 0:
                 save_checkpoint(next_index=i+1, processed=processed, found=len(found_ids))
-                write_snapshot_array(RESULT_SNAPSHOT, id2name)
+                # write_snapshot_array(RESULT_SNAPSHOT, id2name)
                 print(f"   [checkpoint] 跑到 {i+1}/{total}，已找到 {len(found_ids)}")
 
             time.sleep(PAUSE)
@@ -287,14 +283,14 @@ def main(limit_games: int | None = None, max_apps: int | None = None):
         print("\n偵測到中斷（Ctrl+C），先幫你存檢查點…")
         next_i = (i + 1) if 'i' in locals() else start_idx
         save_checkpoint(next_index=next_i, processed=processed, found=len(found_ids))
-        write_snapshot_array(RESULT_SNAPSHOT, id2name)
+        # write_snapshot_array(RESULT_SNAPSHOT, id2name)
         print("已存檢查點，隨時可再執行續跑。")
         return
 
 
     # 跑完收尾
     save_checkpoint(next_index=total, processed=processed, found=len(found_ids))
-    write_snapshot_array(RESULT_SNAPSHOT, id2name)
+    # write_snapshot_array(RESULT_SNAPSHOT, id2name)
     print("完成！總遊戲數：", len(found_ids))
     print("結果（逐行 JSON）在：", RESULT_JSONL)
     print("快照（陣列 JSON）在：", RESULT_SNAPSHOT)
