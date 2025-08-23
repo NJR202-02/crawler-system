@@ -232,6 +232,7 @@ def save_reviews_checkpoint(next_index: int, processed_games: int):
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
+# ---------- 主程式 ----------
 # 主流程：爬取遊戲資訊（可中斷續跑）
 def main(limit_games: int | None = None, max_apps: int | None = None):
     print("1) 載入全部 app 清單…")
