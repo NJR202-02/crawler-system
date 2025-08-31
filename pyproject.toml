@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
     "celery>=5.5.3",
+    "ipykernel>=6.29.5",
     "pandas>=2.0.3",
     "requests>=2.32.4",
 ]

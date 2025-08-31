@@ -8,7 +8,7 @@ URL_ALL = "https://api.steampowered.com/ISteamApps/GetAppList/v2/"
 URL_DETAIL = "https://store.steampowered.com/api/appdetails"
 URL_REVIEWS = "https://store.steampowered.com/appreviews/{appid}"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0",
 }
 
 PAUSE = 0.12                 # 每顆之間停頓
@@ -38,7 +38,7 @@ def get_game_info_if_game(appid: int) -> dict | None:
     全量 call appdetails（不帶 filters/cc/l）。
     若為 game，回傳只含指定欄位的 dict；否則回 None。
     """
-    params = {"appids": str(appid)}
+    params = {"appids": str(appid), "l": "tchinese", "cc": "TW"}
     tries = 1 + RETRY
     for _ in range(tries):
         try:
