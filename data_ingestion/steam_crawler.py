@@ -1,221 +1,70 @@
-import requests
-import time
-import json
-import os
-from typing import Set, Dict, Tuple
+import os, time, json, requests
+import pandas as pd
+from typing import List, Dict
+from datetime import datetime, timezone
 
-URL_ALL = "https://api.steampowered.com/ISteamApps/GetAppList/v2/"
+from data_ingestion.mysql import upload_data_to_mysql, upload_data_to_mysql_upsert, game_info_table
+
+
+URL_ALL    = "https://api.steampowered.com/ISteamApps/GetAppList/v2/"
 URL_DETAIL = "https://store.steampowered.com/api/appdetails"
-URL_REVIEWS = "https://store.steampowered.com/appreviews/{appid}"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-}
+URL_REVIEWS= "https://store.steampowered.com/appreviews/{appid}"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/138.0.0.0 Safari/537.36"}
 
-PAUSE = 0.12                 # 每顆之間停頓
-RETRY = 2                    # 失敗重試次數（不含第一次）
-CHECKPOINT_EVERY = 100       # 每處理幾筆就存一次檢查點
+PAUSE = 0.12
+RETRY = 2
+CHECKPOINT_EVERY = 100
 
-CHECKPOINT_FILE = "checkpoint.json"                    # 存「跑到第幾筆」
-RESULT_JSONL = "steam_games.jsonl"                     # 每行一筆遊戲資訊
-RESULT_SNAPSHOT = "steam_games_snapshot.json"          # 週期性輸出一份陣列快照
-REVIEWS_JSONL = "steam_reviews.jsonl"                  # 每行一筆評論
-REVIEWS_CHECKPOINT_FILE = "reviews_checkpoint.json"    # 記錄抓到第幾個遊戲
+# --- 輸出 ---
+OUTPUT_DIR   = "output"
+GAMES_CSV    = os.path.join(OUTPUT_DIR, "steam_games.csv")
+GENRES_CSV   = os.path.join(OUTPUT_DIR, "steam_game_genres.csv")
+REVIEWS_CSV  = os.path.join(OUTPUT_DIR, "steam_reviews.csv")
+CHECKPOINT_FILE = "checkpoint.json"
+REVIEWS_CHECKPOINT_FILE = "reviews_checkpoint.json"
 
+# ---------- 小工具 ----------
+def ensure_output():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-
-# ---------- 基礎函式 ----------
-# 取得所有ID
-def get_all_apps():
-    # 取得全部 app 清單（每筆含 appid 與 name）。
-    resp = requests.get(URL_ALL, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("applist", {}).get("apps", [])
-
-
-# 取得遊戲資訊（含判定是否為遊戲）
-def get_game_info_if_game(appid: int) -> dict | None:
-    """
-    全量 call appdetails（不帶 filters/cc/l）。
-    若為 game，回傳只含指定欄位的 dict；否則回 None。
-    """
-    params = {"appids": str(appid), "l": "tchinese", "cc": "TW"}
-    tries = 1 + RETRY
-    for _ in range(tries):
-        try:
-            r = requests.get(URL_DETAIL, params=params, headers=HEADERS, timeout=30)
-            if r.status_code != 200:
-                time.sleep(0.5); continue
-
-            payload = r.json()
-            root = payload.get(str(appid), {})
-            if not root.get("success"):
-                return None
-
-            info = root.get("data") or {}
-            if info.get("type") != "game":
-                return None
-
-            # developers 兼容舊欄位 'developer'
-            developers = info.get("developers")
-            if not developers:
-                dev = info.get("developer")
-                developers = [dev] if dev else []
-
-            return {
-                "name": info.get("name"),
-                "steam_gameid": info.get("steam_appid"),
-                "is_free": info.get("is_free", False),
-                "supported_languages": info.get("supported_languages"),
-                "developers": developers,
-                "price_overview": info.get("price_overview"),  # 免費/區不可售可能沒有
-                "platforms": info.get("platforms"),
-                "genres": info.get("genres") or [],
-            }
-
-        except requests.RequestException:
-            time.sleep(0.5)
-    return None
+def append_rows_csv(path: str, rows: List[Dict]):
+    """用 pandas 追加寫入（自動判斷 header），避免一次吃爆記憶體。"""
+    if not rows: 
+        return
+    df = pd.DataFrame(rows)
+    df['uploaded_at'] = datetime.now(timezone.utc)  # 新增 uploaded_at 欄位，設為現在時間    
+    header = not os.path.exists(path)
+    df.to_csv(path, mode="a", index=False, header=header, encoding="utf-8-sig")
+    upload_data_to_mysql(table_name="game_info", df=df, mode="append")
+    print("寫入csv檔")
 
 
-# 取已存遊戲 ID
-def load_game_ids_from_result() -> list[int]:
-    ids, _ = load_existing_from_jsonl(RESULT_JSONL)  # 會同時辨識 appid / steam_gameid
-    return sorted(ids)
+def load_existing_ids_from_csv(path: str) -> set[int]:
+    if not os.path.exists(path):
+        return set()
+    try:
+        s = pd.read_csv(path, usecols=["steam_gameid"])["steam_gameid"].dropna().astype(int)
+        return set(s.tolist())
+    except Exception:
+        return set()
 
+def save_checkpoint(next_index: int, processed: int, found: int):
+    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+        json.dump({"next_index": next_index, "processed": processed, "found_game_ids": found, "ts": time.time()}, f)
 
-# 逐款抓評論
-def fetch_reviews_for_app(appid: int, out_path: str, max_pages: int | None = None):
-    """
-    依 URL_REVIEWS 參數抓該 app 的所有頁（或到 max_pages），逐行寫 JSONL。
-    寫入欄位示例：
-      steam_gameid, recommendationid, steamid, playtime_forever_min, voted_up,
-      language, review, timestamp_created
-    """
-    seen: set[str] = set()      # 去重（保險）
-    cursor = "*"
-    pages = 0
-
-    while True:
-        url = URL_REVIEWS.format(appid=appid)
-        try:
-            params = {                          # ← 補回固定參數
-                "json": 1,
-                "filter": "recent",
-                "language": "all",
-                "day_range": 30,
-                "num_per_page": 100,
-                "cursor": cursor,
-            }            
-            r = requests.get(url, params=params, headers=HEADERS, timeout=30)
-            if r.status_code != 200:
-                time.sleep(0.5); continue
-            data = r.json()
-        except requests.RequestException:
-            time.sleep(0.5); continue
-        except ValueError:
-            time.sleep(0.5); continue
-
-        reviews = data.get("reviews", []) or []
-        if not reviews:
-            break
-
-        # 逐行落盤（不囤記憶體）
-        with open(out_path, "a", encoding="utf-8") as f:
-            for rv in reviews:
-                rid = rv.get("recommendationid")
-                if rid in seen:
-                    continue
-                seen.add(rid)
-
-                row = {
-                    "steam_gameid": int(appid),
-                    "recommendationid": rid,
-                    "steamid": rv.get("author", {}).get("steamid"),
-                    "playtime_forever_min": rv.get("author", {}).get("playtime_forever"),
-                    "voted_up": rv.get("voted_up"),
-                    "language": rv.get("language"),
-                    "review": rv.get("review"),
-                    "timestamp_created": rv.get("timestamp_created"),
-                }
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            f.flush()
-
-        pages += 1
-        new_cursor = data.get("cursor")
-        if not new_cursor or new_cursor == cursor:  # ← 防死循環
-            break
-        cursor = new_cursor
-
-        if max_pages and pages >= max_pages:
-            break
-        time.sleep(PAUSE)
-
-
-# ---------- 檔案/檢查點工具 ----------
-# 取資訊檢查點
 def load_checkpoint() -> int:
-    # 回傳上次處理到的 index（下一次要從這裡開始）。沒有就回 0。
     if not os.path.exists(CHECKPOINT_FILE):
         return 0
     try:
         with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-            return int(obj.get("next_index", 0))
+            return int((json.load(f) or {}).get("next_index", 0))
     except Exception:
         return 0
 
+def save_reviews_checkpoint(next_index: int, processed_games: int):
+    with open(REVIEWS_CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+        json.dump({"next_index": next_index, "processed_games": processed_games, "ts": time.time()}, f)
 
-# 存資訊檢查點
-def save_checkpoint(next_index: int, processed: int, found: int):
-    obj = {"next_index": next_index, "processed": processed, "found_game_ids": found, "ts": time.time()}
-    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
-# 取得現有json檔
-def load_existing_from_jsonl(path: str) -> Tuple[Set[int], Dict[int, str]]:
-    ids: Set[int] = set()
-    id2name: Dict[int, str] = {}
-    if not os.path.exists(path):
-        return ids, id2name
-
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                v = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(v, int):
-                ids.add(v)
-            elif isinstance(v, dict):
-                appid = v.get("appid")
-                if not isinstance(appid, int):
-                    appid = v.get("steam_gameid")      
-                if isinstance(appid, int):
-                    ids.add(appid)
-                    name = v.get("name", "")
-                    if name:
-                        id2name[appid] = name
-    return ids, id2name
-
-
-def write_snapshot_array(path: str, id2name: Dict[int, str]):
-    # 把目前累積的 {appid: name} 寫成陣列 JSON，排序後好讀。
-    rows = [{"appid": appid, "name": id2name.get(appid, "")} for appid in sorted(id2name)]
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
-
-
-def append_jsonl(path: str, obj: dict):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        f.flush()
-
-
-# 評論檢查點
 def load_reviews_checkpoint() -> int:
     if not os.path.exists(REVIEWS_CHECKPOINT_FILE):
         return 0
@@ -225,112 +74,207 @@ def load_reviews_checkpoint() -> int:
     except Exception:
         return 0
 
-# 存評論檢查點
-def save_reviews_checkpoint(next_index: int, processed_games: int):
-    obj = {"next_index": next_index, "processed_games": processed_games, "ts": time.time()}
-    with open(REVIEWS_CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+# ---------- 抓資料 ----------
+def get_all_apps():
+    r = requests.get(URL_ALL, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return r.json().get("applist", {}).get("apps", [])
 
+def get_game_info_if_game(appid: int) -> dict | None:
+    params = {"appids": str(appid), "l": "tchinese", "cc": "TW"}
+    tries = 1 + RETRY
+    for _ in range(tries):
+        try:
+            r = requests.get(URL_DETAIL, params=params, headers=HEADERS, timeout=30)
+            if r.status_code != 200:
+                time.sleep(0.5); continue
+            payload = r.json()
+            root = payload.get(str(appid), {})
+            if not root.get("success"):
+                return None
+            info = root.get("data") or {}
+            if info.get("type") != "game":
+                return None
 
-# ---------- 主程式 ----------
-# 主流程：爬取遊戲資訊（可中斷續跑）
+            developers = info.get("developers") or ([info.get("developer")] if info.get("developer") else [])
+            publishers = info.get("publishers") or []
+
+            # 主表 row（扁平）
+            game_row = {
+                "steam_gameid": info.get("steam_appid"),
+                "name": info.get("name"),
+                "required_age": info.get("required_age"),
+                "is_free": info.get("is_free", False),
+                "header_image": info.get("header_image"),
+                "supported_languages": info.get("supported_languages"),
+                "developers": "|".join(map(str, developers)),
+                "publishers": "|".join(map(str, publishers)),
+                "price_final_formatted": (info.get("price_overview") or {}).get("final_formatted"),
+                "platforms_windows": (info.get("platforms") or {}).get("windows"),
+                "platforms_mac":     (info.get("platforms") or {}).get("mac"),
+                "platforms_linux":   (info.get("platforms") or {}).get("linux"),
+                "release_date": (info.get("release_date") or {}).get("date"),
+            }
+
+            # 關聯表 rows（多列）
+            genre_rows = []
+            for g in (info.get("genres") or []):
+                genre_rows.append({
+                    "steam_gameid": info.get("steam_appid"),
+                    "genre_id": g.get("id"),
+                    "genre_desc": g.get("description"),
+                })
+
+            return {"game_row": game_row, "genre_rows": genre_rows}
+
+        except requests.RequestException:
+            time.sleep(0.5)
+    return None
+
+def fetch_reviews_for_app(appid: int, max_pages: int | None = None):
+    """回傳一個 app 的評論 rows（分頁逐批 append 到 CSV；不囤大量記憶體）。"""
+    cursor = "*"
+    pages  = 0
+    seen   = set()
+    while True:
+        params = {
+            "json": 1, "filter": "recent", "language": "all",
+            "num_per_page": 100, "cursor": cursor
+        }
+        try:
+            r = requests.get(URL_REVIEWS.format(appid=appid), params=params, headers=HEADERS, timeout=30)
+            if r.status_code != 200:
+                time.sleep(0.5); continue
+            data = r.json()
+        except (requests.RequestException, ValueError):
+            time.sleep(0.5); continue
+
+        reviews = data.get("reviews") or []
+        if not reviews:
+            break
+
+        rows = []
+        for rv in reviews:
+            rid = rv.get("recommendationid")
+            if not rid or rid in seen:
+                continue
+            seen.add(rid)
+            rows.append({
+                "steam_gameid": int(appid),
+                "recommendationid": rid,
+                "steamid": (rv.get("author") or {}).get("steamid"),
+                "playtime_forever_min": (rv.get("author") or {}).get("playtime_forever"),
+                "voted_up": rv.get("voted_up"),
+                "language": rv.get("language"),
+                "review": rv.get("review"),
+                "timestamp_created": rv.get("timestamp_created"),
+            })
+
+        append_rows_csv(REVIEWS_CSV, rows)
+
+        pages += 1
+        nxt = data.get("cursor")
+        if not nxt or nxt == cursor:
+            break
+        if max_pages and pages >= max_pages:
+            break
+        cursor = nxt
+        time.sleep(PAUSE)
+
+# ---------- 主流程 ----------
 def main(limit_games: int | None = None, max_apps: int | None = None):
-    print("1) 載入全部 app 清單…")
+    ensure_output()
     apps = get_all_apps()
     total = len(apps)
-    print("   總數：", total)
-
-    # 讀上次 checkpoint 與已寫入紀錄
     start_idx = load_checkpoint()
-    found_ids, id2name = load_existing_from_jsonl(RESULT_JSONL)
-    print(f"2) 從索引 {start_idx} 續跑；已累積遊戲數：{len(found_ids)}")
+    existed_ids = load_existing_ids_from_csv(GAMES_CSV)
+
+    print(f"[games] 總數 {total}，從索引 {start_idx} 續跑；已存在 {len(existed_ids)} 款")
 
     processed = 0
     found_this_run = 0
+    buf_games: list[Dict] = []
+    buf_genres: list[Dict] = []
+
     try:
         for i in range(start_idx, total):
             if max_apps and processed >= max_apps:
-                break  # 可選：只掃前 max_apps 個 app（更快）            
+                break
             app = apps[i]
             appid = app["appid"]
-            name = app.get("name", "")
+
             info = get_game_info_if_game(appid)
-
             if info:
-                sid = int(info.get("steam_gameid") or appid)
-                if sid not in found_ids:               
-                    append_jsonl(RESULT_JSONL, info)
-                    found_ids.add(sid)
-                    id2name[sid] = info.get("name") or name
+                sid = int(info["game_row"].get("steam_gameid") or appid)
+                if sid not in existed_ids:
+                    buf_games.append(info["game_row"])
+                    buf_genres.extend(info["genre_rows"])
+                    existed_ids.add(sid)
                     found_this_run += 1
-                    
-                    if limit_games and found_this_run >= limit_games:
-                        # 提前結束前做個小收尾，之後可無縫續跑
-                        save_checkpoint(next_index=i+1, processed=processed+1, found=len(found_ids))
-                        # write_snapshot_array(RESULT_SNAPSHOT, id2name)
-                        print(f"   已蒐集 {found_this_run} 款，達到上限 {limit_games}，先收。")
-                        break
-                                              
-            processed += 1
 
+                    if limit_games and found_this_run >= limit_games:
+                        append_rows_csv(GAMES_CSV, buf_games); buf_games.clear()
+                        append_rows_csv(GENRES_CSV, buf_genres); buf_genres.clear()
+                        save_checkpoint(next_index=i+1, processed=processed+1, found=len(existed_ids))
+                        print(f"[games] 蒐集到 {found_this_run}/{limit_games}，先收。")
+                        break
+
+            processed += 1
             if processed % CHECKPOINT_EVERY == 0:
-                save_checkpoint(next_index=i+1, processed=processed, found=len(found_ids))
-                # write_snapshot_array(RESULT_SNAPSHOT, id2name)
-                print(f"   [checkpoint] 跑到 {i+1}/{total}，已找到 {len(found_ids)}")
+                append_rows_csv(GAMES_CSV, buf_games); buf_games.clear()
+                append_rows_csv(GENRES_CSV, buf_genres); buf_genres.clear()
+                save_checkpoint(next_index=i+1, processed=processed, found=len(existed_ids))
+                print(f"[games] checkpoint @ {i+1}/{total}，累計 {len(existed_ids)}")
 
             time.sleep(PAUSE)
 
     except KeyboardInterrupt:
-        print("\n偵測到中斷（Ctrl+C），先幫你存檢查點…")
+        print("\n[games] Ctrl+C，先存檢查點…")
+        append_rows_csv(GAMES_CSV, buf_games); buf_games.clear()
+        append_rows_csv(GENRES_CSV, buf_genres); buf_genres.clear()
         next_i = (i + 1) if 'i' in locals() else start_idx
-        save_checkpoint(next_index=next_i, processed=processed, found=len(found_ids))
-        # write_snapshot_array(RESULT_SNAPSHOT, id2name)
-        print("已存檢查點，隨時可再執行續跑。")
+        save_checkpoint(next_index=next_i, processed=processed, found=len(existed_ids))
         return
 
+    append_rows_csv(GAMES_CSV, buf_games)
+    append_rows_csv(GENRES_CSV, buf_genres)
+    save_checkpoint(next_index=total, processed=processed, found=len(existed_ids))
+    print(f"[games] 完成，總遊戲數：{len(existed_ids)}")
+    print(f"  → {GAMES_CSV}")
+    print(f"  → {GENRES_CSV}")
 
-    # 跑完收尾
-    save_checkpoint(next_index=total, processed=processed, found=len(found_ids))
-    # write_snapshot_array(RESULT_SNAPSHOT, id2name)
-    print("完成！總遊戲數：", len(found_ids))
-    print("結果（逐行 JSON）在：", RESULT_JSONL)
-    print("快照（陣列 JSON）在：", RESULT_SNAPSHOT)
+def load_game_ids_from_games_csv(limit: int | None = None) -> list[int]:
+    ids = sorted(load_existing_ids_from_csv(GAMES_CSV))
+    return ids[:limit] if limit else ids
 
-
-# 主流程：爬取遊戲評論（可中斷續跑）
 def main_reviews(max_pages_per_app: int | None = None, limit_games: int | None = None):
-    game_ids = load_game_ids_from_result()
-    if limit_games:
-        game_ids = game_ids[:limit_games]    
+    ensure_output()
+    game_ids = load_game_ids_from_games_csv(limit_games)
     total = len(game_ids)
     start_idx = load_reviews_checkpoint()
-    print(f"[reviews] 從索引 {start_idx} 開始，共 {total} 款遊戲（已限制前 {limit_games} 款）" if limit_games else
-          f"[reviews] 從索引 {start_idx} 開始，共 {total} 款遊戲")
+    print(f"[reviews] 從索引 {start_idx} 開始，共 {total} 款")
 
     processed = 0
     try:
         for i in range(start_idx, total):
             appid = game_ids[i]
-            fetch_reviews_for_app(appid, REVIEWS_JSONL, max_pages=max_pages_per_app)
+            fetch_reviews_for_app(appid, max_pages=max_pages_per_app)
             processed += 1
-
             if processed % CHECKPOINT_EVERY == 0:
                 save_reviews_checkpoint(next_index=i+1, processed_games=processed)
-                print(f"   [reviews checkpoint] 跑到 {i+1}/{total}")
-
+                print(f"[reviews] checkpoint @ {i+1}/{total}")
             time.sleep(PAUSE)
-
     except KeyboardInterrupt:
-        print("\n偵測到中斷（Ctrl+C），先幫你存評論檢查點…")
+        print("\n[reviews] Ctrl+C，先存檢查點…")
         next_i = (i + 1) if 'i' in locals() else start_idx
         save_reviews_checkpoint(next_index=next_i, processed_games=processed)
-        print("已存評論檢查點，隨時可再續跑。")
         return
 
     save_reviews_checkpoint(next_index=total, processed_games=processed)
-    print(f"[reviews] 完成，已處理 {processed} / {total} 款。輸出：{REVIEWS_JSONL}")
-
+    print(f"[reviews] 完成 → {REVIEWS_CSV}")
 
 if __name__ == "__main__":
+    # 先抓 10 款遊戲；也可以把兩個參數拿掉全跑
     main(limit_games=10, max_apps=10)
+    # 每款抓 1 頁評論試跑
     main_reviews(max_pages_per_app=1, limit_games=10)
