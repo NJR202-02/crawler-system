@@ -2,5 +2,8 @@
 output/
 *.pyc
 .cache
-*.json
+*.csv
+*.log
+airflow/logs/
+.env
 *.jsonl

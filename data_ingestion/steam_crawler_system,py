@@ -1,0 +1,427 @@
+import os, time, re, requests, json
+import pandas as pd
+from datetime import datetime, timezone
+from sqlalchemy import create_engine, inspect
+from data_ingestion.config import MYSQL_USERNAME, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_PORT
+
+# ------- 基本設定 -------
+URL_ALL     = "https://api.steampowered.com/ISteamApps/GetAppList/v2/"
+URL_DETAIL  = "https://store.steampowered.com/api/appdetails"
+URL_REVIEW  = "https://store.steampowered.com/appreviews/{appid}"
+HEADERS = {"User-Agent": "Mozilla/5.0 Chrome/138.0.0.0"}
+
+PAUSE = 0.12
+BATCH = 500
+
+OUTPUT_DIR  = "output"
+INFO_CSV    = os.path.join(OUTPUT_DIR, "game_info.csv")
+DISC_CSV    = os.path.join(OUTPUT_DIR, "discount.csv")
+GENRE_CSV   = os.path.join(OUTPUT_DIR, "game_genre.csv")
+REV_CSV     = os.path.join(OUTPUT_DIR, "game_review.csv")
+REV_DTL_CSV = os.path.join(OUTPUT_DIR, "game_review_detail.csv")
+AUTHOR_CSV  = os.path.join(OUTPUT_DIR, "author.csv")
+
+# —— MySQL（照你的設定）——
+USE_DB  = True
+MYSQL_DATABASE = "steam"
+DB_URL = f"mysql+pymysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}?charset=utf8mb4"
+ENGINE = create_engine(DB_URL, pool_pre_ping=True)
+
+# 目標表名（依你給的最終表）
+TBL_GAME_INFO   = "game_info"
+TBL_DISCOUNT    = "discount"
+TBL_GAME_GENRE  = "game_genre"
+TBL_REVIEW      = "game_review"           # 最新覆寫：每款先刪再寫入
+TBL_REVIEW_DTL  = "game_review_detail"
+TBL_AUTHOR      = "author"
+
+# —— 先小量驗證 —— 
+LIMIT_IDS = 50            # None = 全部 ids
+MAX_REVIEW_PAGES = 1     # None = 全部分頁
+
+# ------- 小工具 -------
+def ensure_output():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def to_mysql(df: pd.DataFrame, table: str):
+    if df is None or df.empty:
+        return
+    df.to_sql(table, con=ENGINE, if_exists="append", index=False, method="multi", chunksize=1000)
+
+def strip_html(s: str | None) -> str | None:
+    if not s: 
+        return s
+    return re.sub(r"<.*?>", "", s)
+
+def cents_to_int(v):
+    """DB 存 cents（整數）；展示再 /100。"""
+    try:
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
+def epoch_to_utc(ts):
+    if ts in (None, "", 0): 
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+# ---------- 建表（第一次跑用） ----------
+def ensure_tables_for_core():
+    """
+    用空 DataFrame 架出三張 appdetails 表，以免第一次跑時 to_sql 自動推型別不一致。
+    欄位與你的最終表一致。
+    """
+    insp = inspect(ENGINE)
+    with ENGINE.begin() as conn:
+        if not insp.has_table(TBL_GAME_INFO):
+            pd.DataFrame({
+                "app_id":             pd.Series(dtype="int64"),
+                "name":               pd.Series(dtype="object"),
+                "required_age":       pd.Series(dtype="int64"),
+                "is_free":            pd.Series(dtype="bool"),
+                "header_image":       pd.Series(dtype="object"),
+                "supported_languages":pd.Series(dtype="object"),  # 半形逗號
+                "developers":         pd.Series(dtype="object"),
+                "publishers":         pd.Series(dtype="object"),
+                "initial_price":            pd.Series(dtype="int64"),   # cents (TWD)
+                "platforms_windows":  pd.Series(dtype="bool"),
+                "platforms_mac":      pd.Series(dtype="bool"),
+                "platforms_linux":    pd.Series(dtype="bool"),
+                "release_date":       pd.Series(dtype="object"),  # 原 API 字串，不強轉
+            }).head(0).to_sql(TBL_GAME_INFO, con=conn, if_exists="append", index=False)
+
+        if not insp.has_table(TBL_DISCOUNT):
+            pd.DataFrame({
+                # discount_id(AI,PK) 由 DB 自己增，不在 DataFrame
+                "app_id":            pd.Series(dtype="int64"),
+                "discount_price":    pd.Series(dtype="int64"),   # cents
+                "discount_percent":  pd.Series(dtype="int64"),
+                "capture_date":      pd.Series(dtype="object"),  # UTC 字串
+            }).head(0).to_sql(TBL_DISCOUNT, con=conn, if_exists="append", index=False)
+
+        if not insp.has_table(TBL_GAME_GENRE):
+            pd.DataFrame({
+                # genre_id(AI,PK) 由 DB 自己增，不在 DataFrame
+                "app_id":     pd.Series(dtype="int64"),
+                "genre_id":   pd.Series(dtype="object"),
+                "genre_desc": pd.Series(dtype="object"),
+            }).head(0).to_sql(TBL_GAME_GENRE, con=conn, if_exists="append", index=False)
+
+def ensure_review_tables():
+    insp = inspect(ENGINE)
+    with ENGINE.begin() as conn:
+        if not insp.has_table(TBL_REVIEW):
+            pd.DataFrame({
+                "steam_app_id":        pd.Series(dtype="int64"),
+                "num_reviews":         pd.Series(dtype="int64"),
+                "review_score":        pd.Series(dtype="int64"),
+                "review_score_desc":   pd.Series(dtype="object"),
+                "total_positive":      pd.Series(dtype="int64"),
+                "total_negative":      pd.Series(dtype="int64"),
+                "total_reviews":       pd.Series(dtype="int64"),
+            }).head(0).to_sql(TBL_REVIEW, con=conn, if_exists="append", index=False)
+
+        if not insp.has_table(TBL_REVIEW_DTL):
+            pd.DataFrame({
+                "app_id":                     pd.Series(dtype="int64"),
+                "author_id":                  pd.Series(dtype="object"),
+                "num_games_owned":            pd.Series(dtype="int64"),
+                "num_reviews":                pd.Series(dtype="int64"),
+                "playtime_forever":           pd.Series(dtype="int64"),
+                "playtime_last_two_weeks":    pd.Series(dtype="int64"),
+                "playtime_at_review":         pd.Series(dtype="int64"),
+                "last_played":                pd.Series(dtype="int64"),
+                "language":                   pd.Series(dtype="object"),
+                "review":                     pd.Series(dtype="object"),
+                "timestamp_created":          pd.Series(dtype="object"),
+                "timestamp_updated":          pd.Series(dtype="object"),
+                "voted_up":                   pd.Series(dtype="bool"),
+                "votes_up":                   pd.Series(dtype="int64"),
+                "votes_funny":                pd.Series(dtype="int64"),
+                "weighted_vote_score":        pd.Series(dtype="object"),
+                "comment_count":              pd.Series(dtype="int64"),
+                "steam_purchase":             pd.Series(dtype="bool"),
+                "received_for_free":          pd.Series(dtype="bool"),
+                "written_during_early_access":pd.Series(dtype="bool"),
+            }).head(0).to_sql(TBL_REVIEW_DTL, con=conn, if_exists="append", index=False)
+
+        if not insp.has_table(TBL_AUTHOR):
+            pd.DataFrame({
+                "author_id": pd.Series(dtype="object"),
+            }).head(0).to_sql(TBL_AUTHOR, con=conn, if_exists="append", index=False)
+
+
+# ------- API -------
+def get_all_appids(limit: int | None = None) -> list[int]:
+    r = requests.get(URL_ALL, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    apps = r.json().get("applist", {}).get("apps", [])
+    ids = [int(x["appid"]) for x in apps if isinstance(x.get("appid"), int)]
+    return ids[:limit] if limit else ids
+
+def fetch_appdetails_bundle(appid: int):
+    """
+    回傳三份資料：
+      game_info_row, discount_row, genre_rows(list)
+    若不是 game 則回 (None, None, [])。
+    """
+    try:
+        r = requests.get(
+            URL_DETAIL,
+            params={"appids": str(appid), "l": "tchinese", "cc": "TW"},
+            headers=HEADERS, timeout=30
+        )
+        if r.status_code != 200:
+            return None, None, []
+        payload = r.json()
+        root = payload.get(str(appid), {})
+        if not root.get("success"):
+            return None, None, []
+        info = root.get("data") or {}
+        if info.get("type") != "game":
+            return None, None, []
+
+        steam_appid = info.get("steam_appid")
+
+        # 語言：去 HTML -> 半形逗號分隔
+        langs_raw = strip_html(info.get("supported_languages") or "")
+        supported_languages = None
+        if langs_raw:
+            parts = [x.strip() for x in re.split(r"[;,/|、]+", langs_raw) if x.strip()]
+            supported_languages = ",".join(parts) if parts else None
+
+        # 平台三欄（布林）
+        plats = info.get("platforms") or {}
+        plat_win = bool(plats.get("windows"))
+        plat_mac = bool(plats.get("mac"))
+        plat_linux = bool(plats.get("linux"))
+
+        # 開發/發行（沿用舊規則：用 | 串）
+        devs = info.get("developers") or ([info.get("developer")] if info.get("developer") else [])
+        pubs = info.get("publishers") or []
+        developers = "|".join(map(str, devs)) if devs else None
+        publishers = "|".join(map(str, pubs)) if pubs else None
+
+        # 價格（DB 存 cents 整數）← 這裡改回讀 'initial'
+        po = info.get("price_overview") or {}
+        initial_cents = cents_to_int(po.get("initial"))
+        final_cents   = cents_to_int(po.get("final"))
+        disc_percent  = po.get("discount_percent")
+
+        # game_info
+        game_info_row = {
+            "app_id": steam_appid,                         # PK
+            "name": info.get("name"),
+            "required_age": info.get("required_age"),
+            "is_free": bool(info.get("is_free")),
+            "header_image": info.get("header_image"),
+            "supported_languages": supported_languages,    # 半形逗號
+            "developers": developers,
+            "publishers": publishers,
+            "initial_price": initial_cents,                # cents (TWD)
+            "platforms_windows":  plat_win,
+            "platforms_mac":      plat_mac,
+            "platforms_linux":    plat_linux,
+            "release_date": (info.get("release_date") or {}).get("date"),
+        }
+
+        # discount（歷史快照）
+        discount_row = {
+            "app_id": steam_appid,
+            "discount_price": final_cents,                 # cents (TWD)
+            "discount_percent": disc_percent,
+            "capture_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        # game_genre（多列）
+        genre_rows = []
+        for g in (info.get("genres") or []):
+            genre_rows.append({
+                "app_id": steam_appid,
+                "genre_id": g.get("id"),
+                "genre_desc": g.get("description"),
+            })
+
+        return game_info_row, discount_row, genre_rows
+
+    except requests.RequestException:
+        return None, None, []
+
+def fetch_reviews_one_app(appid: int, max_pages: int | None = None):
+    """
+    回傳：
+      review_summary_row（game_review 一列，最新覆寫）
+      review_detail_rows（list）
+      author_rows（list，批內去重）
+    """
+    rows_detail, rows_author = [], []
+    summary_row = None
+    cursor, pages = "*", 0
+    seen_rid, seen_author = set(), set()
+
+    while True:
+        params = {
+            "json": 1, "filter": "recent", "language": "all",
+            "day_range": 365*2, "num_per_page": 100, "cursor": cursor
+        }
+        try:
+            r = requests.get(URL_REVIEW.format(appid=appid), params=params, headers=HEADERS, timeout=30)
+            if r.status_code != 200:
+                break
+            data = r.json()
+        except (requests.RequestException, ValueError):
+            break
+
+        if summary_row is None:
+            qs = data.get("query_summary") or {}
+            summary_row = {
+                "steam_app_id": appid,
+                "num_reviews": qs.get("num_reviews"),
+                "review_score": qs.get("review_score"),
+                "review_score_desc": qs.get("review_score_desc"),
+                "total_positive": qs.get("total_positive"),
+                "total_negative": qs.get("total_negative"),
+                "total_reviews": qs.get("total_reviews"),
+            }
+
+        reviews = data.get("reviews") or []
+        if not reviews:
+            break
+
+        for rv in reviews:
+            rid = rv.get("recommendationid")
+            if not rid or rid in seen_rid:
+                continue
+            seen_rid.add(rid)
+            au = rv.get("author") or {}
+            aid = au.get("steamid")
+
+            if aid and aid not in seen_author:
+                seen_author.add(aid)
+                rows_author.append({"author_id": aid})
+
+            rows_detail.append({
+                "app_id": appid,
+                "author_id": aid,
+                "num_games_owned": au.get("num_games_owned"),
+                "num_reviews": au.get("num_reviews"),
+                "playtime_forever": au.get("playtime_forever"),
+                "playtime_last_two_weeks": au.get("playtime_last_two_weeks"),
+                "playtime_at_review": au.get("playtime_at_review"),
+                "last_played": au.get("last_played"),
+                "language": rv.get("language"),
+                "review": rv.get("review"),
+                "timestamp_created": epoch_to_utc(rv.get("timestamp_created")),
+                "timestamp_updated": epoch_to_utc(rv.get("timestamp_updated")),
+                "voted_up": rv.get("voted_up"),
+                "votes_up": rv.get("votes_up"),
+                "votes_funny": rv.get("votes_funny"),
+                "weighted_vote_score": rv.get("weighted_vote_score"),
+                "comment_count": rv.get("comment_count"),
+                "steam_purchase": rv.get("steam_purchase"),
+                "received_for_free": rv.get("received_for_free"),
+                "written_during_early_access": rv.get("written_during_early_access"),
+            })
+
+        pages += 1
+        if max_pages and pages >= max_pages:
+            break
+        nxt = data.get("cursor")
+        if not nxt or nxt == cursor:
+            break
+        cursor = nxt
+        time.sleep(PAUSE)
+
+    return summary_row, rows_detail, rows_author
+
+# ------- 主流程 -------
+def run():
+    ensure_output()
+
+    # 先把所有表建好（第一次跑用）
+    if USE_DB:
+        ensure_tables_for_core()
+        ensure_review_tables()
+
+    # 1) 取得 appid（可限量）
+    ids = get_all_appids(limit=LIMIT_IDS)
+    print(f"共取得 {len(ids)} 個 appid，開始抓 appdetails …")
+
+    # 2) appdetails → 三表
+    info_rows, disc_rows, genre_rows = [], [], []
+    for i, appid in enumerate(ids, 1):
+        gi, dc, gs = fetch_appdetails_bundle(appid)
+        if gi:
+            info_rows.append(gi)
+            disc_rows.append(dc)
+            genre_rows.extend(gs)
+        if i % 200 == 0:
+            print(f"  progress: {i}/{len(ids)}")
+        time.sleep(PAUSE)
+
+    df_info  = pd.DataFrame(info_rows)
+    df_disc  = pd.DataFrame(disc_rows)
+    df_genre = pd.DataFrame(genre_rows)
+
+    # # CSV（若你暫時還想留存）
+    # df_info.to_csv(INFO_CSV, index=False, encoding="utf-8-sig")
+    # df_disc.to_csv(DISC_CSV, index=False, encoding="utf-8-sig")
+    # df_genre.to_csv(GENRE_CSV, index=False, encoding="utf-8-sig")
+    # print(f"✅ appdetails CSV：\n  {INFO_CSV}\n  {DISC_CSV}\n  {GENRE_CSV}")
+
+    # MySQL
+    if USE_DB:
+        to_mysql(df_info,  TBL_GAME_INFO)
+        to_mysql(df_disc,  TBL_DISCOUNT)
+        to_mysql(df_genre, TBL_GAME_GENRE)
+        print("✅ appdetails 已上傳 MySQL")
+
+    # 3) reviews → 三表（每款拿完就寫檔/上傳）
+    for p in (REV_CSV, REV_DTL_CSV, AUTHOR_CSV):
+        if os.path.exists(p): os.remove(p)
+
+    app_list = df_info["app_id"].tolist() if not df_info.empty else []
+    print(f"開始抓 reviews（共 {len(app_list)} 款，每款頁數上限={MAX_REVIEW_PAGES}）")
+
+    for idx, appid in enumerate(app_list, 1):
+        summary, details, authors = fetch_reviews_one_app(int(appid), max_pages=MAX_REVIEW_PAGES)
+
+        # # CSV 追加（可關掉）
+        # if summary:
+        #     pd.DataFrame([summary]).to_csv(
+        #         REV_CSV, mode="a", index=False, header=not os.path.exists(REV_CSV), encoding="utf-8-sig"
+        #     )
+        # if details:
+        #     pd.DataFrame(details).to_csv(
+        #         REV_DTL_CSV, mode="a", index=False, header=not os.path.exists(REV_DTL_CSV), encoding="utf-8-sig"
+        #     )
+        # if authors:
+        #     pd.DataFrame(authors).drop_duplicates(subset=["author_id"]).to_csv(
+        #         AUTHOR_CSV, mode="a", index=False, header=not os.path.exists(AUTHOR_CSV), encoding="utf-8-sig"
+        #     )
+
+        # DB：summary 覆寫（先刪再插）
+        if USE_DB:
+            with ENGINE.begin() as conn:
+                if summary:
+                    conn.exec_driver_sql(f"DELETE FROM {TBL_REVIEW} WHERE steam_app_id = %s", (appid,))
+                    pd.DataFrame([summary]).to_sql(TBL_REVIEW, con=conn, if_exists="append", index=False)
+
+                if details:
+                    pd.DataFrame(details).to_sql(TBL_REVIEW_DTL, con=conn, if_exists="append", index=False, method="multi")
+
+                if authors:
+                    pd.DataFrame(authors).drop_duplicates(subset=["author_id"]).to_sql(
+                        TBL_AUTHOR, con=conn, if_exists="append", index=False
+                    )
+
+        print(f"  [{idx}/{len(app_list)}] app {appid}: summary={1 if summary else 0}, details={len(details)}, authors={len(authors)}")
+        time.sleep(PAUSE)
+
+    # print(f"🎯 全部完成。CSV：\n  - {INFO_CSV}\n  - {DISC_CSV}\n  - {GENRE_CSV}\n  - {REV_CSV}\n  - {REV_DTL_CSV}\n  - {AUTHOR_CSV}")
+
+if __name__ == "__main__":
+    run()

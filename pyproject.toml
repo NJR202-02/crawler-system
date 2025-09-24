@@ -5,10 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
-    "celery>=5.5.3",
+    "celery==5.3.6",
     "ipykernel>=6.29.5",
     "pandas>=2.0.3",
+    "pymysql==1.1.2",
     "requests>=2.32.4",
+    "sqlalchemy==1.4.36",
 ]
 
 [build-system]
@@ -17,3 +19,4 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["data_ingestion"]
+
